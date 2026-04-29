@@ -1,0 +1,1072 @@
+# gui/pages/xe_vao_page.py
+"""
+Tab Xe Vào — Redesigned:
+- Camera laptop + IoT (trái)
+- Form xử lý + Treeview xe đang đỗ (phải)
+- Xóa Lane ComboBox
+- Layout đồng bộ với Xe Ra
+- Treeview thay cho textbox
+"""
+import os
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from tkinter import ttk, filedialog, messagebox
+
+import customtkinter as ctk
+import cv2
+from PIL import Image, ImageTk
+
+try:
+    from pyzbar.pyzbar import decode as zbar_decode
+except ImportError:
+    zbar_decode = None
+
+if (__package__ or "").startswith("gui"):
+    from ..styles import AppStyle
+    from ..utils.camera import CameraHandler, IoTCameraHandler, save_capture
+    from ..utils.db_local import lookup_by_barcode, process_entry, get_active
+else:
+    from gui.styles import AppStyle
+    from gui.utils.camera import CameraHandler, IoTCameraHandler, save_capture
+    from gui.utils.db_local import lookup_by_barcode, process_entry, get_active
+
+
+BARCODE_TEST_DIR = Path(__file__).resolve().parents[2] / "createbarcode" / "barcodes"
+LEGACY_TEST_DIR = Path("/home/minhviet/Documents/TestCamera")
+
+
+class XeVaoPage(ctk.CTkFrame):
+    def __init__(self, parent, main_app, on_transaction_updated=None):
+        super().__init__(parent, fg_color="transparent")
+        self.main_app = main_app
+        self.on_updated = on_transaction_updated
+        self._transition_job = None
+        self._transition_remaining = 0
+        self._transition_done = None
+        self._active_popup = None
+        self._last_processed_code = ""
+        self._last_processed_ts = 0.0
+        self._scan_cooldown_seconds = 3.0
+        self._scan_block_until = 0.0
+        self._is_processing = False
+        self._polling_active = {"IN": False, "OUT": False}
+
+        self.grid_columnconfigure(0, weight=5)
+        self.grid_columnconfigure(1, weight=4)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._build_cam_panel()
+        self._build_right_panel()
+        # Chờ 2s mới tải danh sách xe đang đỗ
+        self.after(2000, self._refresh_active_list)
+
+    # ── Camera panel (trái) ───────────────────────────────────────────────────
+    def _build_cam_panel(self):
+        p = ctk.CTkFrame(self, fg_color=AppStyle.CARD_BG, corner_radius=14)
+        p.grid(row=0, column=0, padx=(8, 5), pady=8, sticky="nsew")
+
+        ctk.CTkLabel(
+            p, text="📷  Camera Giám Sát — Xe Vào",
+            font=AppStyle.SUBTITLE_FONT, text_color=AppStyle.PRIMARY
+        ).pack(anchor="w", padx=14, pady=(14, 4))
+
+        ctk.CTkLabel(
+            p, text="Laptop camera  (barcode · QR · REFC · biển số)",
+            font=AppStyle.SMALL_FONT, text_color=AppStyle.TEXT_SECONDARY
+        ).pack(anchor="w", padx=14)
+
+        self.lbl_local = ctk.CTkLabel(
+            p, text="Camera đang chờ...", fg_color="#0F172A", height=220,
+            corner_radius=10, text_color=AppStyle.TEXT_MUTED
+        )
+        self.lbl_local.pack(fill="x", padx=14, pady=(4, 8))
+
+        # Nút quét từ thư mục
+        tf = ctk.CTkFrame(p, fg_color="transparent")
+        tf.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(
+            tf, text="📂 Quét từ thư mục barcode",
+            command=self._scan_from_test_folder,
+            fg_color=AppStyle.SUCCESS, height=32, font=AppStyle.SMALL_FONT
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            p, text="IoT ESP32 camera  (ảnh từ inbox thư mục)",
+            font=AppStyle.SMALL_FONT, text_color=AppStyle.TEXT_SECONDARY
+        ).pack(anchor="w", padx=14)
+
+        self.lbl_iot = ctk.CTkLabel(
+            p, text="Camera IoT đang chờ...", fg_color="#0F172A", height=220,
+            corner_radius=10, text_color=AppStyle.TEXT_MUTED
+        )
+        self.lbl_iot.pack(fill="x", padx=14, pady=(4, 8))
+
+        self.lbl_cam_status = ctk.CTkLabel(
+            p, text="⬤  Camera xe vào đang chờ khởi động",
+            font=AppStyle.SMALL_FONT, text_color=AppStyle.TEXT_MUTED
+        )
+        self.lbl_cam_status.pack(anchor="w", padx=14, pady=(0, 10))
+
+        self.local_cam = CameraHandler(self.lbl_local, callback=self._on_barcode, on_detection=self._on_detection)
+        from pathlib import Path
+        base_dir = Path(__file__).resolve().parents[2]
+        self.iot_cam = IoTCameraHandler(self.lbl_iot, on_detection=self._on_detection, storage_dir=str(base_dir / "Lich_su_xe_vao"))
+
+    def _scan_from_test_folder(self):
+        """Mở dialog chọn folder, liệt kê ảnh, xác nhận trước khi quét."""
+        # Mở dialog chọn folder, ưu tiên createbarcode/barcodes
+        initial_dir = str(BARCODE_TEST_DIR) if BARCODE_TEST_DIR.exists() else str(LEGACY_TEST_DIR)
+        folder = filedialog.askdirectory(
+            title="Chọn thư mục chứa ảnh barcode",
+            initialdir=initial_dir
+        )
+        
+        if not folder:
+            # Người dùng hủy
+            return
+        
+        folder_path = Path(folder)
+        
+        # Liệt kê ảnh trong folder
+        image_files = []
+        for ext in ["*.jpg", "*.png", "*.jpeg", "*.bmp"]:
+            image_files.extend(sorted(folder_path.glob(ext), key=lambda item: item.stat().st_mtime, reverse=True))
+        
+        if not image_files:
+            self._show_status_alert(f"Không tìm thấy ảnh trong folder: {folder_path}", "orange")
+            return
+        
+        # Hiển thị dialog chọn ảnh + xác nhận
+        self._show_image_selector_dialog(image_files, folder_path)
+    
+    def _show_image_selector_dialog(self, image_files: list, folder_path: Path):
+        """Hiển thị dialog để chọn ảnh từ danh sách và xác nhận."""
+        dialog = ctk.CTkToplevel(self.main_app.root if hasattr(self, 'main_app') else None)
+        dialog.title("Chọn ảnh barcode")
+        dialog.geometry("600x500")
+        dialog.resizable(False, False)
+        
+        # ── Frame chứa danh sách ảnh ──
+        list_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        ctk.CTkLabel(
+            list_frame, text=f"Tìm thấy {len(image_files)} ảnh trong thư mục",
+            font=("Helvetica", 12, "bold")
+        ).pack(anchor="w", pady=(0, 8))
+        
+        # Listbox để chọn ảnh
+        listbox_frame = ctk.CTkFrame(list_frame)
+        listbox_frame.pack(fill="both", expand=True, pady=(0, 10))
+        
+        from tkinter import Listbox
+        listbox = Listbox(listbox_frame, height=12)
+        listbox.pack(fill="both", expand=True, side="left")
+        
+        scrollbar = ttk.Scrollbar(listbox_frame, command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.config(yscrollcommand=scrollbar.set)
+        
+        # Thêm các file vào listbox
+        for img_file in image_files:
+            listbox.insert("end", img_file.name)
+        
+        # Chọn ảnh đầu tiên mặc định
+        if len(image_files) > 0:
+            listbox.select_set(0)
+            listbox.see(0)
+        
+        def _on_select(*args):
+            """Hiển thị preview khi chọn ảnh."""
+            selection = listbox.curselection()
+            if not selection:
+                return
+            idx = selection[0]
+            img_file = image_files[idx]
+            frame = cv2.imread(str(img_file))
+            if frame is None:
+                return
+            
+            # Resize để hiển thị preview
+            h, w = frame.shape[:2]
+            scale = min(250 / w, 150 / h)
+            resized = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            
+            # Cập nhật preview (nếu có widget preview)
+            if hasattr(dialog, 'preview_label'):
+                photoimage = ImageTk.PhotoImage(pil_img)
+                dialog.preview_label.config(image=photoimage)
+                dialog.preview_label.image = photoimage
+        
+        # Bind sự kiện chọn
+        listbox.bind("<<ListboxSelect>>", _on_select)
+        
+        # ── Frame preview ──
+        preview_frame = ctk.CTkFrame(list_frame, fg_color="#0F172A", corner_radius=8)
+        preview_frame.pack(fill="both", expand=True, pady=(0, 10))
+        
+        dialog.preview_label = ctk.CTkLabel(
+            preview_frame, text="Preview ảnh", fg_color="#0F172A",
+            text_color=AppStyle.TEXT_MUTED, height=150
+        )
+        dialog.preview_label.pack(fill="both", expand=True)
+        
+        # Hiển thị preview của ảnh đầu tiên
+        if len(image_files) > 0:
+            _on_select()
+        
+        # ── Nút hành động ──
+        btn_frame = ctk.CTkFrame(list_frame, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=(10, 0))
+        
+        def _on_confirm():
+            selection = listbox.curselection()
+            if not selection:
+                messagebox.showwarning("Lỗi", "Vui lòng chọn một ảnh!")
+                return
+            
+            idx = selection[0]
+            selected_file = image_files[idx]
+            frame = cv2.imread(str(selected_file))
+            
+            if frame is None:
+                messagebox.showerror("Lỗi", "Không thể đọc ảnh!")
+                return
+            
+            # Quét mã từ ảnh đã chọn
+            found_code = self._decode_any_code(frame)
+            dialog.destroy()
+            
+            if found_code:
+                self._show_status_alert(f"✅ Đã quét từ file: {selected_file.name}", "green")
+                self._set_barcode(found_code)
+            else:
+                self._show_status_alert(f"⚠️ Không tìm thấy mã QR/Barcode trong: {selected_file.name}", "orange")
+        
+        def _on_cancel():
+            dialog.destroy()
+        
+        ctk.CTkButton(
+            btn_frame, text="✅ Xác nhận quét", command=_on_confirm,
+            fg_color=AppStyle.SUCCESS, height=32
+        ).pack(side="left", padx=(0, 6))
+        
+        ctk.CTkButton(
+            btn_frame, text="❌ Hủy", command=_on_cancel,
+            fg_color=AppStyle.SURFACE, height=32
+        ).pack(side="left")
+
+    def _decode_any_code(self, frame):
+        if frame is None:
+            return ""
+
+        candidates = [frame]
+        if zbar_decode is not None:
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                candidates.extend([
+                    gray,
+                    cv2.equalizeHist(gray),
+                    cv2.GaussianBlur(gray, (3, 3), 0),
+                ])
+            except Exception:
+                pass
+
+            for candidate in candidates:
+                try:
+                    decoded = zbar_decode(candidate)
+                except Exception:
+                    decoded = []
+                for item in decoded or []:
+                    code = item.data.decode("utf-8", errors="ignore").strip()
+                    if code:
+                        return code
+
+        try:
+            data, _, _ = cv2.QRCodeDetector().detectAndDecode(frame)
+            if data:
+                return data.strip()
+        except Exception:
+            pass
+
+        return ""
+
+    # ── Right panel (form + Treeview) ─────────────────────────────────────────
+    def _build_right_panel(self):
+        right = ctk.CTkFrame(self, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        # ── Form xử lý xe vào ────────────────────────────────────────────────
+        p = ctk.CTkFrame(right, fg_color=AppStyle.CARD_BG, corner_radius=14)
+        p.grid(row=0, column=0, sticky="ew", padx=(5, 8), pady=(8, 5))
+
+        title_frame = ctk.CTkFrame(p, fg_color="transparent")
+        title_frame.pack(fill="x", padx=14, pady=(14, 8))
+        
+        ctk.CTkLabel(
+            title_frame, text="📋  Xử lý xe vào",
+            font=AppStyle.SUBTITLE_FONT, text_color=AppStyle.PRIMARY
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            title_frame, text="🗑 Xóa", width=60, height=28,
+            fg_color=AppStyle.SURFACE, hover_color=AppStyle.BORDER,
+            text_color=AppStyle.TEXT_SECONDARY, font=AppStyle.SMALL_FONT,
+            command=self._clear
+        ).pack(side="right")
+
+        # Barcode entry
+        self.ent_barcode = ctk.CTkEntry(
+            p, placeholder_text="Quét / nhập barcode · QR · REFC",
+            height=36, fg_color=AppStyle.SURFACE, border_color=AppStyle.BORDER,
+            text_color=AppStyle.TEXT_PRIMARY
+        )
+        self.ent_barcode.pack(fill="x", padx=14, pady=(0, 6))
+        self.ent_barcode.bind("<Return>", lambda e: self._preview())
+
+        # Plate entry
+        self.ent_plate = ctk.CTkEntry(
+            p, placeholder_text="Biển số (tự động từ camera IoT)",
+            height=36, fg_color=AppStyle.SURFACE, border_color=AppStyle.BORDER,
+            text_color=AppStyle.TEXT_PRIMARY
+        )
+        self.ent_plate.pack(fill="x", padx=14, pady=(0, 8))
+
+        # Buttons (đã loại bỏ do chuyển sang tự động hóa)
+        ctk.CTkLabel(p, text="Luồng xe vào đã được tự động hóa. Vui lòng quét mã.", font=AppStyle.SMALL_FONT, text_color=AppStyle.SUCCESS).pack(fill="x", padx=14, pady=(0, 10))
+
+        # Info labels (đồng bộ layout giống Xe Ra)
+        inf = ctk.CTkFrame(p, fg_color=AppStyle.SURFACE, corner_radius=10)
+        inf.pack(fill="x", padx=14, pady=(0, 14))
+
+        def _row(label, attr, bold=False):
+            f = ctk.CTkFrame(inf, fg_color="transparent")
+            f.pack(fill="x", padx=10, pady=2)
+            ctk.CTkLabel(f, text=label, font=AppStyle.SMALL_FONT,
+                         text_color=AppStyle.TEXT_MUTED, width=130, anchor="w"
+                         ).pack(side="left")
+            fnt = AppStyle.BODY_BOLD if bold else AppStyle.BODY_FONT
+            lbl = ctk.CTkLabel(f, text="-", font=fnt,
+                               text_color=AppStyle.TEXT_PRIMARY, anchor="w")
+            lbl.pack(side="left", fill="x", expand=True)
+            setattr(self, attr, lbl)
+
+        _row("Chủ xe:",         "inf_name")
+        _row("MSSV:",           "inf_id")
+        _row("Biển số:",        "inf_plate", True)
+        _row("Thời gian vào:",  "inf_time")
+        _row("Số dư:",          "inf_balance")
+        _row("Khóa xe:",        "inf_lock")
+
+        # ── Treeview xe đang đỗ ──────────────────────────────────────────────
+        h = ctk.CTkFrame(right, fg_color=AppStyle.CARD_BG, corner_radius=14)
+        h.grid(row=1, column=0, sticky="nsew", padx=(5, 8), pady=(5, 8))
+        h.grid_rowconfigure(1, weight=1)
+        h.grid_columnconfigure(0, weight=1)
+
+        hdr = ctk.CTkFrame(h, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(14, 6))
+        ctk.CTkLabel(
+            hdr, text="🚗  Danh sách xe đang đỗ",
+            font=AppStyle.SUBTITLE_FONT, text_color=AppStyle.PRIMARY
+        ).pack(side="left")
+        ctk.CTkButton(
+            hdr, text="⟳", width=36, fg_color=AppStyle.PRIMARY,
+            command=self._refresh_active_list
+        ).pack(side="right")
+
+        tf = ctk.CTkFrame(h, fg_color="transparent")
+        tf.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        tf.grid_columnconfigure(0, weight=1)
+        tf.grid_rowconfigure(0, weight=1)
+
+        # Style cho Treeview
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("XeVao.Treeview", rowheight=26, font=("Helvetica", 11),
+                        background="#FFFFFF", fieldbackground="#FFFFFF",
+                        foreground="#1F2937")
+        style.configure("XeVao.Treeview.Heading", font=("Helvetica", 11, "bold"),
+                        background="#EEF2F7", foreground="#3B5998")
+        style.map("XeVao.Treeview",
+                  background=[("selected", "#3B82F6")],
+                  foreground=[("selected", "white")])
+
+        cols = ("BienSo", "ChuXe", "MSSV", "GioVao")
+        self.active_tree = ttk.Treeview(
+            tf, columns=cols, show="headings",
+            style="XeVao.Treeview", height=8
+        )
+        headings = {"BienSo": "Biển số", "ChuXe": "Chủ xe", "MSSV": "MSSV", "GioVao": "Giờ vào"}
+        widths = [100, 140, 80, 130]
+        for col, w in zip(cols, widths):
+            self.active_tree.heading(col, text=headings[col])
+            self.active_tree.column(col, anchor="center", width=w, stretch=False)
+
+        sy = ttk.Scrollbar(tf, orient="vertical", command=self.active_tree.yview)
+        sx = ttk.Scrollbar(tf, orient="horizontal", command=self.active_tree.xview)
+        self.active_tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+
+        self.active_tree.grid(row=0, column=0, sticky="nsew")
+        sy.grid(row=0, column=1, sticky="ns")
+        sx.grid(row=1, column=0, sticky="ew")
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def _clear(self):
+        self.ent_barcode.delete(0, "end")
+        self.ent_plate.delete(0, "end")
+        self._last_processed_code = ""
+        self._last_scanned_code = ""
+        self._last_processed_ts = 0.0
+        self._scan_block_until = 0.0
+        for a in ("inf_name", "inf_id", "inf_plate", "inf_time", "inf_balance", "inf_lock"):
+            getattr(self, a).configure(text="-", text_color=AppStyle.TEXT_PRIMARY)
+
+    def _on_barcode(self, code: str):
+        if code:
+            self.main_app.run_in_main_thread(lambda: self._set_barcode(code))
+
+    def _set_barcode(self, code: str):
+        code_key = (code or "").strip().upper()
+        if not code_key:
+            return
+
+        now = time.time()
+        if self._is_processing or now < self._scan_block_until:
+            return
+
+        if code_key == self._last_processed_code and (now - self._last_processed_ts) < self._scan_cooldown_seconds:
+            return
+
+        self._last_processed_code = code_key
+        self._last_processed_ts = now
+        self._last_scanned_code = code
+        self._scan_block_until = now + 10.0
+        display_code = code
+        if "MSSV" in code and code.startswith("{"):
+            try:
+                import json
+                data = json.loads(code)
+                display_code = data.get("MSSV", code)
+            except Exception: pass
+
+        self.ent_barcode.delete(0, "end")
+        self.ent_barcode.insert(0, display_code)
+        
+        # Bắt đầu giao thức xe vào (INBOUND PROTOCOL)
+        self._execute_inbound_protocol(code)
+
+    def _execute_inbound_protocol(self, full_code: str):
+        """Lập trình logic xử lý cho Luồng Xe Vào (INBOUND PROTOCOL)."""
+        if self._is_processing:
+            return
+        self._is_processing = True
+
+        try:
+            self.lbl_cam_status.configure(text="🟡 Đang xử lý Luồng Xe Vào...", text_color=AppStyle.WARNING)
+
+            # Ngăn xử lý vào ngoài giờ hoạt động (23:00 - 06:00)
+            try:
+                from ..utils.db_local import is_operating_hours
+                if not is_operating_hours():
+                    self._is_processing = False
+                    self._show_status_alert("⛔ Ngoài giờ hoạt động (23:00 – 06:00). Không nhận xe vào!", "red")
+                    return
+            except Exception:
+                # Nếu có lỗi kiểm tra giờ thì không block (để tránh khóa nhầm vì lỗi phụ thuộc)
+                pass
+    
+            # Bước 1: Quét mã & Đối chiếu (local trước)
+            student_info = lookup_by_barcode(full_code)
+    
+            # Lỗi 1 (Sai mã): Nếu không có dữ liệu
+            if not student_info:
+                self._is_processing = False
+                self._show_status_alert("⚠️ Cảnh báo: Người dùng chưa đăng ký trong hệ thống. Vui lòng liên hệ Admin.", "orange")
+                return
+    
+            # Hiển thị thông tin sơ bộ lên UI
+            self._update_info_ui(student_info)
+            self.update_idletasks()
+    
+            # Kiểm tra Tình trạng Khóa ngay tại bước 1.5
+            if student_info.get("tinh_trang") == "Khóa":
+                self._is_processing = False
+                self.lbl_cam_status.configure(text="⛔ Thẻ RFID hiện đang bị KHÓA. Vui lòng liên hệ Admin.", text_color=AppStyle.DANGER)
+                return
+    
+            ma_sv = student_info.get("ma_sv", full_code)
+            bien_so_db = ""
+            if student_info.get("vehicles"):
+                bien_so_db = student_info["vehicles"][0]["bien_so"]
+    
+            # Bước 2: Kiểm tra trạng thái đỗ (local)
+            from ..utils.db_local import is_vehicle_in_lot
+            ma_rfid = student_info.get("ma_rfid", full_code)
+            active_tx = is_vehicle_in_lot(ma_rfid=ma_rfid, bien_so=bien_so_db)
+    
+            # Lỗi 2 (Xe ma): Nếu xe ĐÃ ở trong bãi
+            if active_tx:
+                self._is_processing = False
+                bs = active_tx.get("BienSo", bien_so_db)
+                self._show_status_alert(f"⛔ Lỗi Logic: Xe biển số {bs} hiện đang được ghi nhận ở trong bãi. Yêu cầu kiểm tra lại hệ thống!", "red")
+                return
+    
+            # Bước 3: Gọi API /register-student (trong Thread — httpx non-blocking)
+            self.lbl_cam_status.configure(text="📡 Đang đăng ký session với server...", text_color=AppStyle.WARNING)
+    
+            def _register_and_wait():
+                import httpx
+                from smart_parking.config import API_ENDPOINT
+    
+                try:
+                    # Gọi POST /register-student bằng httpx (sync trong thread)
+                    with httpx.Client(timeout=5.0) as client:
+                        resp = client.post(
+                            f"{API_ENDPOINT}/register-student",
+                            json={"ma_sv": ma_sv, "lane": "IN"}
+                        )
+    
+                        if resp.status_code == 404:
+                            # Sinh viên không tồn tại trên server
+                            self.main_app.run_in_main_thread(
+                                lambda: (setattr(self, "_is_processing", False), self._show_auto_close_popup("⚠️ Người dùng chưa đăng ký", "orange", 3000))
+                            )
+                            return
+    
+                        if resp.status_code != 200:
+                            msg = resp.json().get("detail", "Lỗi server")
+                            self.main_app.run_in_main_thread(
+                                lambda m=msg: (setattr(self, "_is_processing", False), self._show_status_alert(f"⛔ Server: {m}", "red"))
+                            )
+                            return
+    
+                        # Thành công đăng ký session → Kiểm tra IR sensor trước khi chờ ESP32
+                        self.main_app.run_in_main_thread(
+                            lambda: self.lbl_cam_status.configure(
+                                text="🔍 Đang kiểm tra cảm biến IR...",
+                                text_color=AppStyle.WARNING
+                            )
+                        )
+    
+                        # Kiểm tra IR sensor: có xe chắn không?
+                        ir_ok = True
+                        try:
+                            ir_resp = client.get(f"{API_ENDPOINT}/check-ir", params={"lane": "IN"}, timeout=5.0)
+                            ir_data = ir_resp.json()
+                            if not ir_data.get("detected", False):
+                                ir_ok = False
+                        except Exception:
+                            pass  # Lỗi IR → bỏ qua, tiếp tục
+    
+                        if not ir_ok:
+                            self.main_app.run_in_main_thread(
+                                lambda: (setattr(self, "_is_processing", False), self._show_auto_close_popup("🚫 Không có xe tại cổng vào! IR Sensor không phát hiện xe.", "red", 3000))
+                            )
+                            return
+    
+                        # IR OK → Chủ động kích hoạt ESP32 chụp ảnh qua server
+                        self.main_app.run_in_main_thread(
+                            lambda: self.lbl_cam_status.configure(
+                                text="📷 Đang yêu cầu ESP32 chụp ảnh...",
+                                text_color=AppStyle.WARNING
+                            )
+                        )
+                        try:
+                            trigger_resp = client.get(f"{API_ENDPOINT}/api/vehicle-detected", params={"lane": "IN"}, timeout=10.0)
+                            print(f"[GUI] Trigger vehicle-detected: {trigger_resp.status_code} → {trigger_resp.text[:200]}")
+                        except Exception as trigger_err:
+                            print(f"[GUI] Trigger vehicle-detected failed: {trigger_err}")
+                            # Vẫn tiếp tục polling — có thể ESP32 tự gửi webhook
+    
+                    # Bắt đầu polling /lane-status để cập nhật kết quả
+                    self.main_app.run_in_main_thread(lambda: self._poll_lane_status("IN"))
+    
+                except httpx.ConnectError:
+                    # Server chưa chạy → Fallback sang logic local (giữ tương thích)
+                    self.main_app.run_in_main_thread(
+                        lambda: self._fallback_local_inbound(full_code, student_info, bien_so_db)
+                    )
+                except Exception as e:
+                    self.main_app.run_in_main_thread(
+                        lambda err=e: (setattr(self, "_is_processing", False), self._show_status_alert(f"⛔ Lỗi kết nối server: {err}", "red"))
+                    )
+    
+            threading.Thread(target=_register_and_wait, daemon=True).start()
+
+        except Exception as e:
+            self._is_processing = False
+            self._show_status_alert(f"⛔ Lỗi xử lý xe vào: {e}", "red")
+            return
+
+    def _fallback_local_inbound(self, full_code, student_info, bien_so_db):
+        """Fallback: Xử lý xe vào local khi server API không khả dụng."""
+        self.lbl_cam_status.configure(text="🟠 Server API offline — dùng chế độ local...", text_color=AppStyle.WARNING)
+
+        def _hardware_sync():
+            from ..utils.hardware import trigger_ir_sensor, request_esp32_capture
+
+            if not trigger_ir_sensor("in"):
+                self.main_app.run_in_main_thread(lambda: self._show_status_alert("🔌 Lỗi thiết bị: Cảm biến IR cổng vào không phản hồi.", "orange"))
+
+            if not request_esp32_capture("in"):
+                self.main_app.run_in_main_thread(lambda: self._show_status_alert("📷 Lỗi Camera: Không thể chụp ảnh từ ESP32 cổng vào.", "red"))
+
+            frame = self.local_cam.get_latest_frame()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_plate = (self.ent_plate.get() or bien_so_db or "UNKNOWN").replace("-", "").replace(" ", "")
+            filename = f"{timestamp}_{safe_plate}.jpg"
+
+            save_dir = Path(__file__).resolve().parents[2] / "Lich_su_xe_vao"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            saved_path = str(save_dir / filename)
+
+            if frame is not None:
+                cv2.imwrite(saved_path, frame)
+
+            res = process_entry(full_code, self.ent_plate.get() or bien_so_db, saved_path)
+            self.main_app.run_in_main_thread(lambda: self._on_protocol_finished(res))
+
+        threading.Thread(target=_hardware_sync, daemon=True).start()
+
+    def _poll_lane_status(self, lane: str, retries: int = 15):
+        """Polling GET /lane-status?lane=X để cập nhật kết quả từ ESP32 (max 15 giây)."""
+        # Ngăn polling trùng lặp trên cùng lane
+        if self._polling_active.get(lane, False):
+            return
+        self._polling_active[lane] = True
+
+        if retries <= 0:
+            self._polling_active[lane] = False
+            self.lbl_cam_status.configure(
+                text="⏰ Timeout: ESP32 không phản hồi. Vui lòng kiểm tra kết nối hoặc quét lại!",
+                text_color=AppStyle.DANGER
+            )
+            self._is_processing = False
+            # Show error popup
+            self._show_status_alert(
+                "⚠️ ESP32 chưa chụp ảnh trong 15 giây. Kiểm tra:\n"
+                "• IR sensor phát hiện xe?\n"
+                "• Kết nối WiFi của ESP32?\n"
+                "• Cổng camera khác lỗi hay không?",
+                "orange"
+            )
+            return
+
+        def _check():
+            import httpx
+            from smart_parking.config import API_ENDPOINT
+            try:
+                with httpx.Client(timeout=3.0) as client:
+                    resp = client.get(f"{API_ENDPOINT}/lane-status", params={"lane": lane}, timeout=3.0)
+                    data = resp.json()
+                    return data
+            except Exception as e:
+                return {"status": "pending", "error": str(e)}
+
+        def _do_poll():
+            try:
+                data = _check()
+                status = data.get("status", "pending")
+                
+                if status == "processing":
+                    msg = data.get("message", "Đang xử lý ảnh...")
+                    self.lbl_cam_status.configure(text=f"📷 {msg}", text_color=AppStyle.STATUS_INFO)
+                    self._polling_active[lane] = False
+                    self.after(1000, lambda: self._poll_lane_status(lane, retries - 1))
+                elif status == "pending":
+                    # Chưa có kết quả → poll lại sau 1s
+                    self.lbl_cam_status.configure(
+                        text=f"⏳ Chờ ESP32 chụp ảnh... ({retries}s)",
+                        text_color=AppStyle.WARNING
+                    )
+                    self._polling_active[lane] = False
+                    self.after(1000, lambda: self._poll_lane_status(lane, retries - 1))
+                else:
+                    # Có kết quả → cập nhật UI
+                    self._polling_active[lane] = False
+                    self._is_processing = False
+                    self._on_api_result(data)
+            finally:
+                # Ensure cleanup nếu có exception
+                if retries <= 0:
+                    self._polling_active[lane] = False
+
+        threading.Thread(target=lambda: self.main_app.run_in_main_thread(_do_poll), daemon=True).start()
+
+    def _on_api_result(self, data: dict):
+        """Xử lý kết quả từ API /lane-status."""
+        code = data.get("code", 0)
+        msg = data.get("message", "")
+        image_path = data.get("image_path", "")
+
+        if code == 200:
+            self._scan_block_until = 0.0
+            self.lbl_cam_status.configure(text=f"🟢 {msg}", text_color=AppStyle.STATUS_OK)
+            if image_path:
+                self._display_image_on_label(self.lbl_iot, image_path, 320, 220)
+                self._show_capture_success_popup(msg, image_path, duration=3000)
+            # Mở barie SG90 (5-7s) khi xe vào thành công
+            from ..utils.hardware import open_barrier_sync
+            threading.Thread(target=open_barrier_sync, daemon=True).start()
+            self._refresh_active_list()
+            if callable(self.on_updated):
+                self.on_updated()
+        elif code == 406:
+            self._scan_block_until = 0.0
+            score = data.get("score", 0)
+            self._show_status_alert(f"⚠️ Không khớp biển số! (Độ tin cậy: {score}%)", "orange")
+        elif code == 400:
+            self._scan_block_until = 0.0
+            self._show_status_alert(f"⛔ {msg}", "red")
+        else:
+            self._scan_block_until = 0.0
+            self._show_status_alert(f"⛔ {msg}", "red")
+
+    def _show_capture_success_popup(self, message: str, image_path: str, duration: int = 3000):
+        """Popup thành công xe vào kèm ảnh ESP32 và tự đóng sau vài giây."""
+        if self._active_popup and self._active_popup.winfo_exists():
+            return
+
+        self._active_popup = ctk.CTkToplevel(self)
+        self._active_popup.title("Xe vào thành công")
+        self._active_popup.geometry("620x430")
+        self._active_popup.attributes("-topmost", True)
+        self._active_popup.resizable(False, False)
+
+        self._active_popup.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 310
+        y = self.winfo_y() + (self.winfo_height() // 2) - 215
+        self._active_popup.geometry(f"+{int(x)}+{int(y)}")
+
+        main_frame = ctk.CTkFrame(self._active_popup, fg_color=AppStyle.CARD_BG, corner_radius=15, border_width=2, border_color=AppStyle.SUCCESS)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ctk.CTkLabel(main_frame, text="✅", font=("Helvetica", 40)).pack(pady=(12, 4))
+        ctk.CTkLabel(main_frame, text=message, font=("Helvetica", 15, "bold"), text_color=AppStyle.TEXT_PRIMARY, wraplength=560).pack(pady=(0, 8))
+
+        img_holder = ctk.CTkLabel(main_frame, text="", fg_color=AppStyle.SURFACE, corner_radius=10)
+        img_holder.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        self._display_image_on_label(img_holder, image_path, 560, 260)
+
+        self._active_popup.after(duration, lambda: self._active_popup.destroy() if self._active_popup and self._active_popup.winfo_exists() else None)
+
+    def _show_auto_close_popup(self, message: str, color_type: str = "orange", duration: int = 3000):
+        """Hiện popup tự đóng sau `duration` ms. Dùng CTkToplevel + .after() — không blocking."""
+        if self._active_popup and self._active_popup.winfo_exists():
+            return
+
+        if color_type == "green" or color_type == "success":
+            color = AppStyle.SUCCESS
+            icon = "✅"
+        elif color_type == "orange":
+            color = AppStyle.WARNING
+            icon = "⚠️"
+        else:
+            color = AppStyle.DANGER
+            icon = "⛔"
+
+        self.lbl_cam_status.configure(text=f"⬤ {message}", text_color=color)
+
+        self._active_popup = ctk.CTkToplevel(self)
+        self._active_popup.title("Thông báo hệ thống")
+        self._active_popup.geometry("500x220")
+        self._active_popup.attributes("-topmost", True)
+        self._active_popup.resizable(False, False)
+
+        self._active_popup.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 250
+        y = self.winfo_y() + (self.winfo_height() // 2) - 110
+        self._active_popup.geometry(f"+{int(x)}+{int(y)}")
+
+        main_frame = ctk.CTkFrame(self._active_popup, fg_color=AppStyle.CARD_BG, corner_radius=15, border_width=2, border_color=color)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ctk.CTkLabel(main_frame, text=icon, font=("Helvetica", 40)).pack(pady=(15, 5))
+        ctk.CTkLabel(main_frame, text=message, font=("Helvetica", 15, "bold"), text_color=AppStyle.TEXT_PRIMARY, wraplength=440).pack(expand=True, padx=20, pady=10)
+
+        # Tự đóng sau duration ms
+        self._active_popup.after(duration, lambda: self._active_popup.destroy() if self._active_popup and self._active_popup.winfo_exists() else None)
+
+    def _on_protocol_finished(self, res):
+        self._is_processing = False
+        if res.get("ok"):
+            self._scan_block_until = 0.0
+            self.lbl_cam_status.configure(text="🟢 Xe vào thành công.", text_color=AppStyle.STATUS_OK)
+            image_path = res.get("image_path", "")
+            if image_path:
+                self._display_image_on_label(self.lbl_iot, image_path, 320, 220)
+                self._show_capture_success_popup(res.get("message", "✔ Xe vào thành công."), image_path, duration=3000)
+            # Mở barie SG90 (5-7s) khi local fallback xe vào thành công
+            from ..utils.hardware import open_barrier_sync
+            threading.Thread(target=open_barrier_sync, daemon=True).start()
+            self._refresh_active_list()
+            if callable(self.on_updated):
+                self.on_updated()
+        else:
+            self._scan_block_until = 0.0
+            self._show_status_alert(res.get("message", "Lỗi không xác định"), "red")
+
+    def _show_status_alert(self, message: str, color_type: str = "orange", timeout: int = 0):
+        """Hiển thị CTkToplevel cảnh báo kiểu chuyên nghiệp."""
+        if self._active_popup and self._active_popup.winfo_exists():
+            return
+
+        if color_type == "green" or color_type == "success":
+            color = AppStyle.SUCCESS
+            icon = "✅"
+        elif color_type == "orange":
+            color = AppStyle.WARNING
+            icon = "⚠️"
+        else:
+            color = AppStyle.DANGER
+            icon = "⛔"
+
+        self.lbl_cam_status.configure(text=f"⬤ {message}", text_color=color)
+
+        
+        self._active_popup = ctk.CTkToplevel(self)
+        self._active_popup.title("Thông báo hệ thống")
+        self._active_popup.geometry("500x220")
+        self._active_popup.attributes("-topmost", True)
+        self._active_popup.resizable(False, False)
+        
+        # Center the popup
+        self._active_popup.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - 250
+        y = self.winfo_y() + (self.winfo_height() // 2) - 110
+        self._active_popup.geometry(f"+{int(x)}+{int(y)}")
+
+        main_frame = ctk.CTkFrame(self._active_popup, fg_color=AppStyle.CARD_BG, corner_radius=15, border_width=2, border_color=color)
+        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Icon giả (Exclamation mark / Success mark)
+        icon_lbl = ctk.CTkLabel(main_frame, text=icon, font=("Helvetica", 40))
+        icon_lbl.pack(pady=(15, 5))
+
+
+        lbl = ctk.CTkLabel(main_frame, text=message, font=("Helvetica", 15, "bold"), text_color=AppStyle.TEXT_PRIMARY, wraplength=440)
+        lbl.pack(expand=True, padx=20, pady=10)
+        
+        btn_ok = ctk.CTkButton(main_frame, text="Đóng (3s)", state="disabled", fg_color=AppStyle.TEXT_SECONDARY, command=self._active_popup.destroy)
+        btn_ok.pack(pady=(0, 15), ipadx=20)
+        
+        def _enable_btn(remaining=3):
+            if not self._active_popup or not self._active_popup.winfo_exists():
+                return
+            if remaining > 0:
+                btn_ok.configure(text=f"Đóng ({remaining}s)")
+                self._active_popup.after(1000, lambda: _enable_btn(remaining - 1))
+            else:
+                btn_ok.configure(text="Đã hiểu", state="normal", fg_color=AppStyle.PRIMARY)
+
+        _enable_btn(3)
+        
+        if timeout > 0:
+            self._active_popup.after(timeout, self._active_popup.destroy)
+
+
+    def _on_detection(self, payload: dict):
+        dtype = str(payload.get("type", "")).lower()
+        val = str(payload.get("value", "")).strip().upper()
+        if dtype == "plate":
+            if self.ent_plate.get().strip().upper() != val:
+                self.main_app.run_in_main_thread(
+                    lambda v=val: (self.ent_plate.delete(0, "end"), self.ent_plate.insert(0, v))
+                )
+        elif dtype in ("refc", "qr", "barcode"):
+            if self.ent_barcode.get().strip().upper() != val:
+                self.main_app.run_in_main_thread(
+                    lambda v=val: self._set_barcode(v)
+                )
+
+    def _preview(self, full_code: str = None):
+        bc = full_code or self.ent_barcode.get().strip()
+        if not bc:
+            return
+        self._execute_inbound_protocol(bc)
+
+    def _render_info(self, info):
+        self.after(0, lambda: self._update_info_ui(info))
+
+    def _update_info_ui(self, info):
+        if not info:
+            for a in ("inf_name", "inf_id", "inf_plate", "inf_time", "inf_balance", "inf_lock"):
+                getattr(self, a).configure(text="-", text_color=AppStyle.TEXT_PRIMARY)
+            return
+        self.inf_name.configure(text=info.get("ho_ten", "-"))
+        self.inf_id.configure(text=info.get("ma_sv", "-"))
+
+        # Hiển thị biển số
+        vehicles = info.get("vehicles", [])
+        if vehicles:
+            plates = ", ".join(v["bien_so"] for v in vehicles)
+            self.inf_plate.configure(text=plates, text_color=AppStyle.SUCCESS)
+            # Auto-fill biển số vào ô nhập nếu rỗng
+            if not self.ent_plate.get().strip() and vehicles:
+                self.ent_plate.delete(0, "end")
+                self.ent_plate.insert(0, vehicles[0]["bien_so"])
+        else:
+            self.inf_plate.configure(text="-", text_color=AppStyle.TEXT_PRIMARY)
+
+        self.inf_time.configure(text=datetime.now().strftime("%H:%M:%S  %d/%m/%Y"))
+        self.inf_balance.configure(text=f"{int(info.get('so_du', 0)):,}đ")
+
+        is_locked = info.get("tinh_trang") == "Khóa"
+        self.inf_lock.configure(
+            text="🔒 Khóa" if is_locked else "🔓 Không khóa",
+            text_color=AppStyle.DANGER if is_locked else AppStyle.SUCCESS
+        )
+
+    def _show_result(self, res):
+        if res.get("ok"):
+            self.lbl_cam_status.configure(text="🟢 Xe vào thành công.", text_color=AppStyle.STATUS_OK)
+            self._refresh_active_list()
+            if callable(self.on_updated):
+                self.on_updated()
+        else:
+            self._show_status_alert(res.get("message", "Lỗi"), "red")
+
+    def _submit(self):
+        bc = self.ent_barcode.get().strip()
+        pl = self.ent_plate.get().strip()
+        if not bc:
+            return
+        frame = self.local_cam.get_latest_frame()
+        saved_path = save_capture(frame, "xe_vao") if frame is not None else None
+        threading.Thread(
+            target=lambda: self._on_entry_result(process_entry(bc, pl, saved_path or "")),
+            daemon=True
+        ).start()
+
+    def _on_entry_result(self, res):
+        self.main_app.run_in_main_thread(lambda: self._show_result(res))
+
+    def _show_result(self, res):
+        if res.get("ok"):
+            image_path = res.get("image_path", "")
+            if image_path:
+                self._display_image_on_label(self.lbl_iot, image_path, 320, 220)
+                self._show_capture_success_popup(res.get("message", "✔ Xe vào thành công."), image_path, duration=3000)
+            else:
+                self._show_status_alert(res.get("message"), "green", timeout=3000)
+            self._refresh_active_list()
+            if callable(self.on_updated):
+                self.on_updated()
+        else:
+            self._show_warning_popup("⚠ Lỗi Xe Vào", res.get("message"))
+
+    def _display_image_on_label(self, label, path, max_w, max_h):
+        """Load và hiển thị ảnh lên một CTkLabel."""
+        try:
+            img = Image.open(path).convert("RGB")
+            ratio = min(max_w / img.width, max_h / img.height)
+            nw = int(img.width * ratio)
+            nh = int(img.height * ratio)
+            img = img.resize((nw, nh))
+            ci = ctk.CTkImage(light_image=img, dark_image=img, size=(nw, nh))
+            label.configure(image=ci, text="")
+            label.image = ci
+        except Exception:
+            label.configure(image=None, text="Lỗi hiển thị ảnh")
+
+    # ── Treeview refresh ──────────────────────────────────────────────────────
+    def _refresh_active_list(self):
+        threading.Thread(target=self._load_active_data, daemon=True).start()
+
+    def _load_active_data(self):
+        data = get_active(50)
+        self.main_app.run_in_main_thread(lambda d=data: self._update_active_tree(d))
+
+    def _update_active_tree(self, data):
+        for item in self.active_tree.get_children():
+            self.active_tree.delete(item)
+        if not data:
+            return
+        for item in data:
+            time_in = item.get("time_in", "-")
+            if isinstance(time_in, datetime):
+                time_in = time_in.strftime("%H:%M %d/%m/%Y")
+            elif isinstance(time_in, str):
+                try:
+                    time_in = datetime.fromisoformat(time_in).strftime("%H:%M %d/%m/%Y")
+                except (ValueError, TypeError):
+                    pass
+            self.active_tree.insert("", "end", values=(
+                item.get("license_plate", "-"),
+                item.get("owner_name", "-"),
+                item.get("owner_identity", "-"),
+                time_in,
+            ))
+
+    # ── Camera lifecycle ──────────────────────────────────────────────────────
+    def start_cameras(self):
+        print("[Camera] Đang khởi động camera...")
+        self.cancel_transition()
+        self.local_cam.start()
+        self.iot_cam.start()
+        self._check_camera_status()
+        print("[Camera] Camera đã khởi động.")
+
+    def _check_camera_status(self):
+        """Kiểm tra trạng thái camera (xanh/vàng/đỏ)."""
+        if not self.local_cam.base.running: return
+        
+        now = time.time()
+        last_frame = self.local_cam.base.last_frame_ts
+        diff = now - last_frame if last_frame > 0 else 999
+        
+        if diff < 2.0:
+            # Màu xanh: hoạt động bình thường
+            self.lbl_cam_status.configure(text="⬤ Camera xe vào đang hoạt động (Online)", text_color=AppStyle.STATUS_OK)
+        elif diff < 10.0:
+            # Màu vàng: đang quét (đợi tín hiệu)
+            self.lbl_cam_status.configure(text=f"⬤ Đang chờ tín hiệu camera ({int(diff)}s)...", text_color=AppStyle.WARNING)
+        else:
+            # Màu đỏ: lỗi hệ thống (quá 10s)
+            self.lbl_cam_status.configure(text="⛔ Lỗi hệ thống: Camera không phản hồi quá 10s!", text_color=AppStyle.DANGER)
+            
+        self.after(1000, self._check_camera_status)
+
+    def stop_cameras(self):
+        self.local_cam.stop()
+        self.iot_cam.stop()
+        self.lbl_cam_status.configure(
+            text="⬤  Camera xe vào đang dừng", text_color=AppStyle.TEXT_MUTED
+        )
+
+    def begin_exit_transition(self, s=3, on_complete=None):
+        self.cancel_transition()
+        self._transition_remaining = s
+        self._transition_done = lambda: (self.stop_cameras(), on_complete() if on_complete else None)
+        self._tick()
+
+    def _tick(self):
+        if self._transition_remaining > 0:
+            self.lbl_cam_status.configure(
+                text=f"⏳  Chuyển sang Xe Ra sau {self._transition_remaining}s...",
+                text_color=AppStyle.WARNING
+            )
+            self._transition_remaining -= 1
+            self._transition_job = self.after(1000, self._tick)
+        else:
+            cb = self._transition_done
+            self._transition_done = None
+            self._transition_job = None
+            if cb:
+                cb()
+
+    def cancel_transition(self):
+        if self._transition_job:
+            self.after_cancel(self._transition_job)
+        self._transition_job = None
+        self._transition_done = None
+
+    def get_latest_frame(self):
+        return self.local_cam.get_latest_frame()

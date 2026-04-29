@@ -1,0 +1,3 @@
+﻿transaction_id,license_plate,owner_identity,owner_name,owner_class,owner_major,time_in,time_out,status,fee,owner_balance,rfid_status
+21,43E1-22344,SV21010,Đoàn Văn Trọng,21SPT1,Sư phạm Tin,2026-05-01 22:54:37,,Đang đỗ,0,142891,Hoạt động
+12,73M1-88912,SV21010,Đoàn Văn Trọng,21SPT1,Sư phạm Tin,2026-04-19 09:45:00,2026-05-01 22:54:31,Đã ra,8000,142891,Hoạt động
