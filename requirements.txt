@@ -1,0 +1,39 @@
+# SmartParking Valkyrie Dependencies
+# Version: 2.0.0
+
+# Core
+python-dotenv>=1.0.0
+pyodbc>=4.0.32
+requests>=2.31.0
+customtkinter>=5.2.2
+pyserial>=3.5
+
+# Computer Vision & Image Processing
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+
+# Barcode/QR Detection
+pyzbar>=0.1.9
+
+# QR/Barcode Generation
+qrcode>=7.4
+python-barcode>=0.15.1
+
+# Fuzzy Matching
+thefuzz>=0.19.0
+python-Levenshtein>=0.21.0
+
+# Google Cloud Vision
+google-cloud-vision>=3.5.0
+
+# API Server
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+httpx>=0.24.0
+
+# Development (optional)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0

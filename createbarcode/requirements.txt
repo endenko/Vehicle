@@ -1,0 +1,10 @@
+fastapi==0.136.0
+uvicorn[standard]==0.44.0
+ultralytics==8.4.39
+opencv-python==4.13.0.92
+numpy==2.4.4
+qrcode[pil]==8.2
+requests==2.33.1
+Pillow==12.2.0
+python-barcode==0.16.1
+zxing-cpp==2.3.0
