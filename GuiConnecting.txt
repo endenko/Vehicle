@@ -1,0 +1,155 @@
+import cv2
+import time
+import threading
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+import importlib
+# from app.database import get_db_connection
+# from app.fuzzy_auth import authenticate_vehicle
+
+class SmartParkingValkyrie:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Cục Cảnh sát Valkyrie - Trạm Kiểm soát Bãi Đỗ Xe Thông Minh")
+        self.root.geometry("1280x800")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Trạng thái hệ thống
+        self.running = True
+        self.current_scanned_sv = None
+        self.current_blurry_plate = None
+
+        # Nạp thư viện quét mã siêu tốc
+        try:
+            self.zxingcpp = importlib.import_module("zxingcpp")
+        except ModuleNotFoundError:
+            print("[CẢNH BÁO] Không tìm thấy zxingcpp. Hãy cài đặt: pip install zxing-cpp")
+            self.zxingcpp = None
+
+        self.cap = cv2.VideoCapture(0) # Camera Laptop quét QR
+
+        self.setup_ui()
+        self.update_camera_loop()
+
+    def setup_ui(self):
+        # 1. STATISTICS DASHBOARD (FULL-WIDTH HEADER)
+        # Thiết kế bắt buộc trải dài toàn màn hình theo cấu trúc dự án
+        self.header_frame = tk.Frame(self.root, bg="#1a252c", height=90)
+        self.header_frame.pack(side=tk.TOP, fill=tk.X)
+        self.header_frame.pack_propagate(False)
+
+        tk.Label(self.header_frame, text="HỆ THỐNG KIỂM SOÁT AN NINH VALKYRIE", font=("Arial", 18, "bold"), fg="#00d2ff", bg="#1a252c").pack(pady=(10, 0))
+        
+        self.lbl_stats = tk.Label(self.header_frame, text="Lượt vào: 0 | Lượt ra: 0 | Cảnh báo: 0", font=("Arial", 12), fg="white", bg="#1a252c")
+        self.lbl_stats.pack(pady=5)
+
+        # Khung chứa nội dung chính
+        self.main_content = tk.Frame(self.root)
+        self.main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # 2. KHU VỰC CAMERA LAPTOP (Trái) - CHỈ QUÉT MÃ QR
+        self.left_panel = ttk.LabelFrame(self.main_content, text="Camera Trạm Giám Sát (Nhận Diện Barcode/QR)")
+        self.left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        self.lbl_video = tk.Label(self.left_panel, bg="black")
+        self.lbl_video.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+        self.lbl_qr_result = tk.Label(self.left_panel, text="Mã QR/Barcode: ĐANG CHỜ...", font=("Arial", 14, "bold"), fg="orange")
+        self.lbl_qr_result.pack(pady=10)
+
+        # 3. KHU VỰC DỮ LIỆU ESP32 & THẨM ĐỊNH (Phải)
+        self.right_panel = ttk.Frame(self.main_content, width=450)
+        self.right_panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        self.right_panel.pack_propagate(False)
+
+        # Khu vực hiển thị ảnh ESP32 gửi lên
+        self.esp32_frame = ttk.LabelFrame(self.right_panel, text="Dữ liệu Trinh sát (ESP32-CAM)")
+        self.esp32_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_esp32_img = tk.Label(self.esp32_frame, text="[Chờ tín hiệu từ IR Sensor...]", bg="black", fg="gray", height=12)
+        self.lbl_esp32_img.pack(fill=tk.X, padx=10, pady=10)
+
+        # Bảng kết quả Thẩm định
+        self.auth_frame = ttk.LabelFrame(self.right_panel, text="Kết Quả Thẩm Định")
+        self.auth_frame.pack(fill=tk.X, pady=5)
+
+        self.lbl_ocr_raw = tk.Label(self.auth_frame, text="Cloud Vision (Thô): ---", font=("Arial", 10))
+        self.lbl_ocr_raw.pack(pady=5)
+
+        self.lbl_final_decision = tk.Label(self.auth_frame, text="TRẠNG THÁI: CHỜ KIỂM DUYỆT", font=("Arial", 14, "bold"), fg="gray")
+        self.lbl_final_decision.pack(pady=10)
+
+        # Nhật ký
+        self.log_frame = ttk.LabelFrame(self.right_panel, text="Nhật Ký Vi Phạm")
+        self.log_frame.pack(fill=tk.BOTH, expand=True)
+        self.listbox_log = tk.Listbox(self.log_frame, bg="#f8d7da", fg="#721c24", font=("Arial", 10))
+        self.listbox_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def update_camera_loop(self):
+        if not self.running: return
+
+        ret, frame = self.cap.read()
+        if ret:
+            # Liên tục dùng Zxing quét mã trên laptop
+            if self.zxingcpp is not None:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                results = self.zxingcpp.read_barcodes(gray)
+                if results:
+                    code_text = str(results[0].text).strip()
+                    self.lbl_qr_result.config(text=f"Mã quét được: {code_text}", fg="green")
+                    self.current_scanned_sv = code_text # Ghi nhớ mã SV để chờ ảnh ESP32 gửi lên
+            
+            # Cập nhật GUI
+            display_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(display_frame)
+            img = img.resize((640, 480), Image.Resampling.LANCZOS)
+            imgtk = ImageTk.PhotoImage(image=img)
+            
+            self.lbl_video.imgtk = imgtk
+            self.lbl_video.configure(image=imgtk)
+
+        self.root.after(30, self.update_camera_loop)
+
+    def trigger_esp32_receive(self, image_path):
+        """Hàm này sẽ được gọi bởi API cục bộ khi ESP32 đẩy ảnh về"""
+        if not self.current_scanned_sv:
+            self.listbox_log.insert(0, "[CẢNH BÁO] Có xe tiến vào nhưng chưa quét mã Sinh Viên!")
+            return
+
+        # 1. Hiển thị ảnh ESP32
+        img = Image.open(image_path).resize((300, 200), Image.Resampling.LANCZOS)
+        imgtk = ImageTk.PhotoImage(image=img)
+        self.lbl_esp32_img.imgtk = imgtk
+        self.lbl_esp32_img.config(image=imgtk)
+
+        # 2. Xử lý OCR và Fuzzy Logic (Chạy ngầm tránh đơ GUI)
+        threading.Thread(target=self.process_fuzzy_logic, args=(image_path,), daemon=True).start()
+
+    def process_fuzzy_logic(self, image_path):
+        self.lbl_final_decision.config(text="ĐANG PHÂN TÍCH HỒ SƠ...", fg="orange")
+        
+        # Sensei gọi Google Cloud Vision tại đây để lấy raw_text
+        # Gọi hàm authenticate_vehicle(self.current_scanned_sv, raw_text) tại đây
+        
+        time.sleep(1) # Giả lập thời gian xử lý API
+        
+        # Ví dụ kết quả trả về
+        is_valid = True 
+        message = "CHẤP NHẬN: Khớp 85% với biển 43A1-12345"
+        
+        if is_valid:
+            self.root.after(0, self.lbl_final_decision.config, {"text": message, "fg": "green"})
+        else:
+            self.root.after(0, self.lbl_final_decision.config, {"text": "TỪ CHỐI CẤP PHÉP", "fg": "red"})
+            self.root.after(0, self.listbox_log.insert, 0, f"Vi phạm: {self.current_scanned_sv} - {message}")
+
+    def on_close(self):
+        self.running = False
+        self.cap.release()
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SmartParkingValkyrie(root)
+    root.mainloop()
